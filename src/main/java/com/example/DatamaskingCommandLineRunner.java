@@ -1,40 +1,61 @@
 package com.example;
 
-import java.io.File;
-import java.util.ArrayList;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.nio.charset.Charset;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.builder.ToStringBuilder;
-import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.Option;
-import org.kohsuke.args4j.OptionHandlerFilter;
-import org.kohsuke.args4j.ParserProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.stereotype.Component;
+
+import com.ibm.icu.lang.UCharacter;
+import com.ibm.icu.lang.UProperty;
+import com.opencsv.CSVReader;
+import com.opencsv.CSVWriter;
 
 @Component
 public class DatamaskingCommandLineRunner implements CommandLineRunner {
 
 	private final static Logger logger = LoggerFactory.getLogger(DatamaskingCommandLineRunner.class);
 
-	@Option(required = true, name = "-i", usage = "input from this file", metaVar = "INPUT")
-	private File in = new File(".");
+	@Option(name = "--spring.output.ansi.enabled", hidden = true, usage = "SpringBoot argument")
+	private String springOutputAnsi = "";
 
-	@Option(required = true, name = "-o", usage = "output to this file", metaVar = "OUTPUT")
-	private File out = new File(".");
+	@Option(name = "-h", aliases = "--help", usage = "print usage message and exit")
+	private boolean usageFlag;
 
-	@Option(name = "-F", usage = "set masking fields. require multi field camma separeated", metaVar = "Mask Fields")
+	@Option(name = "-i", metaVar = "input file name", aliases = "--input", required = true, usage = "入力ファイル")
+	private String input = "";
+
+	@Option(name = "-ie", metaVar = "input file encode", aliases = "--input-encode", usage = "入力ファイルの文字コード（未指定の場合はUTF-8）")
+	private String inputEncode = "";
+
+	@Option(name = "-o", metaVar = "output file name", aliases = "--output", required = true, usage = "出力ファイル")
+	private String output = "";
+
+	@Option(name = "-oe", metaVar = "output file encode", aliases = "--output-encode", usage = "入力ファイルの文字コード（未指定の場合はUTF-8）")
+	private String outputEncode = "";
+
+	@Option(name = "-f", metaVar = "fields", aliases = "--fields", usage = "マスク対象列番号")
 	private String fields = "";
-
-	@Argument
-	private List<String> arguments = new ArrayList<String>();
 
 	@Override
 	public void run(String... args) throws Exception {
@@ -43,36 +64,85 @@ public class DatamaskingCommandLineRunner implements CommandLineRunner {
 				Arrays.asList(args).stream().collect(Collectors.joining(",", getClass().getSimpleName() + "[", "]")));
 
 		CmdLineParser parser = new CmdLineParser(this);
-		parser.getProperties();
-		ParserProperties props = ParserProperties.defaults();
-		props.withUsageWidth(80);
-
 		try {
-			List<String> argList = Arrays.asList(args).stream().filter(s -> !StringUtils.startsWith(s, "--spring."))
-					.collect(Collectors.toList());
-			argList.stream().forEach(System.out::println);
-			parser.parseArgument();
-
-			if (arguments.isEmpty())
-				throw new CmdLineException(parser, "No argument is given");
-
+			parser.parseArgument(args);
+			if (usageFlag) {
+				System.out.println("Usage:");
+				parser.printUsage(System.out);
+				return;
+			}
 		} catch (CmdLineException e) {
-			logger.error(e.getMessage(), e);
-			// if there's a problem in the command line,
-			// you'll get this exception. this will report
-			// an error message.
-			System.err.println(e.getMessage());
-			System.err.println("java datamask [options...] arguments...");
-			// print the list of available options
 			parser.printUsage(System.err);
-			System.err.println();
-
-			// print option sample. This is useful some time
-			System.err.println("  Example: java datamasking" + parser.printExample(OptionHandlerFilter.ALL));
-
-			return;
+			throw new IllegalArgumentException(e);
 		}
 
+		System.out.println("データのマスク化を開始します。");
+
+		Path inputPath = Paths.get("", input);
+		Charset inputCharset = Charset.forName(StringUtils.defaultIfBlank(inputEncode, "UTF-8"));
+		Path outputPath = Paths.get("", output);
+		Charset outputCharset = Charset.forName(StringUtils.defaultIfBlank(outputEncode, "UTF-8"));
+		List<Integer> maskFields = Arrays.stream(StringUtils.split(fields, ",")).map(s -> Integer.valueOf(s))
+				.collect(Collectors.toList());
+
+		logger.info("input file=" + inputPath.toAbsolutePath().toString());
+		logger.info("output file=" + outputPath.toAbsolutePath().toString());
+
+		// 読込ファイルはUTF-8に変換しておくこと。
+		try (CSVReader reader = new CSVReader(new BufferedReader(
+				new InputStreamReader(new BufferedInputStream(new FileInputStream(inputPath.toFile())), inputCharset)));
+				CSVWriter writer = new CSVWriter(
+						new BufferedWriter(new OutputStreamWriter(
+								new BufferedOutputStream(new FileOutputStream(outputPath.toFile())), outputCharset)),
+						CSVWriter.DEFAULT_SEPARATOR, CSVWriter.DEFAULT_QUOTE_CHARACTER, CSVWriter.RFC4180_LINE_END)) {
+
+			String[] columns;
+			while ((columns = reader.readNext()) != null) {
+				columns = mask(columns, maskFields);
+				writer.writeNext(columns, false);
+			}
+			writer.flushQuietly();
+		} finally {
+		}
+		System.out.println("データのマスク化が完了しました。");
+	}
+
+	private String[] mask(final String[] columns, List<Integer> maskFields) {
+		String result[] = columns;
+		for (Integer field : maskFields) {
+			int idx = field.intValue() - 1;
+			result[idx] = result[idx].chars().mapToObj(c -> {
+				if (StringUtils.isBlank(String.valueOf(c))) {
+					return String.valueOf(c);
+				} else if (StringUtils.equals("　", String.valueOf(c))) {
+					return "　";
+				} else {
+					if (1 == getCharacterWidth(c)) {
+						return "*";
+					} else {
+						return "＊";
+					}
+				}
+			}).collect(Collectors.joining());
+		}
+		return result;
+	}
+
+	private static int getCharacterWidth(int codePoint) {
+		int value = UCharacter.getIntPropertyValue(codePoint, UProperty.EAST_ASIAN_WIDTH);
+		switch (value) {
+		case UCharacter.EastAsianWidth.NARROW:
+		case UCharacter.EastAsianWidth.NEUTRAL:
+		case UCharacter.EastAsianWidth.HALFWIDTH:
+			return 1;
+		case UCharacter.EastAsianWidth.FULLWIDTH:
+		case UCharacter.EastAsianWidth.WIDE:
+			return 2;
+		case UCharacter.EastAsianWidth.AMBIGUOUS:
+			return (StringUtils.containsAny(Locale.getDefault().getLanguage(), "ja", "vi", "kr", "zh")) ? 2 : 1;
+		default:
+			return 1;
+		}
 	}
 
 }
